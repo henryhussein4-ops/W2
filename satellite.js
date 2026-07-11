@@ -99,6 +99,20 @@ async function db1GetPublic(env, path) {
   } catch (e) { return null; }
 }
 
+/* ---------- Pinecone vector store (replaces Vectorize) ---------- */
+function pcReady(env) { return !!(env.PINECONE_KEY && env.PINECONE_HOST); }
+async function pcFetch(env, path, payload) {
+  try {
+    const r = await fetch(String(env.PINECONE_HOST).replace(/\/$/, "") + path, {
+      method: "POST",
+      headers: { "Api-Key": env.PINECONE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
 /* ---------- Auth: verify Firebase ID token from the Zama app ---------- */
 async function verifyUser(env, idToken) {
   if (!idToken || !env.FB_API_KEY) return null;
@@ -278,7 +292,7 @@ function chunkText(text, size, overlap) {
   return chunks;
 }
 async function handleRagUpsert(env, uid, body) {
-  if (!env.VEC) return json({ ok: false, error: "rag_not_on_this_worker" });
+  if (!pcReady(env)) return json({ ok: false, error: "rag_not_on_this_worker" });
   const docId = String(body.docId || ("doc_" + Date.now())).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 60);
   const source = String(body.source || "document").slice(0, 120);
   const kind = String(body.kind || "doc").slice(0, 20);
@@ -293,29 +307,28 @@ async function handleRagUpsert(env, uid, body) {
     const items = [];
     for (let j = 0; j < batch.length; j++) {
       const id = uid.slice(0, 20) + "_" + docId + "_" + (i + j);
-      items.push({ id, values: vecs[j], namespace: uid, metadata: { uid, docId, source, kind, idx: i + j } });
+      items.push({ id, values: vecs[j], metadata: { docId, source, kind, idx: i + j } });
       await db2Set(env, "rag/" + uid + "/" + docId + "/" + (i + j), { t: batch[j], s: source, k: kind });
       ids.push(id);
     }
-    await env.VEC.upsert(items);
+    const up = await pcFetch(env, "/vectors/upsert", { vectors: items, namespace: uid });
+    if (!up) return json({ ok: false, error: "vector_upsert_failed", stored: ids.length - items.length });
   }
   await db2Set(env, "ragIndex/" + uid + "/" + docId, { source, kind, chunks: chunks.length, ts: Date.now() });
   return json({ ok: true, docId, chunks: chunks.length });
 }
 async function handleRagQuery(env, uid, body) {
-  if (!env.VEC) return json({ ok: false, error: "rag_not_on_this_worker" });
+  if (!pcReady(env)) return json({ ok: false, error: "rag_not_on_this_worker" });
   const q = String(body.query || "").trim().slice(0, 1200);
   if (!q) return json({ ok: false, error: "no_query" });
   const threshold = Math.min(Math.max(Number(body.threshold) || RAG_THRESHOLD_DEFAULT, 0.2), 0.95);
   const topK = Math.min(Math.max(Number(body.topK) || 4, 1), 8);
   const vecs = await runEmbed(env, [q]);
   if (!vecs) return json({ ok: false, error: "embed_failed" });
-  let res;
-  try {
-    res = await env.VEC.query(vecs[0], { topK, namespace: uid, returnMetadata: true });
-  } catch (e) { return json({ ok: false, error: "vector_query_failed" }); }
+  const res = await pcFetch(env, "/query", { vector: vecs[0], topK, namespace: uid, includeMetadata: true });
+  if (!res) return json({ ok: false, error: "vector_query_failed" });
   const matches = [];
-  for (const m of (res && res.matches ? res.matches : [])) {
+  for (const m of (res.matches || [])) {
     if (m.score < threshold) continue;
     const md = m.metadata || {};
     const row = await db2Get(env, "rag/" + uid + "/" + md.docId + "/" + md.idx);
@@ -324,14 +337,14 @@ async function handleRagQuery(env, uid, body) {
   return json({ ok: true, matches, threshold });
 }
 async function handleRagDelete(env, uid, body) {
-  if (!env.VEC) return json({ ok: false, error: "rag_not_on_this_worker" });
+  if (!pcReady(env)) return json({ ok: false, error: "rag_not_on_this_worker" });
   const docId = String(body.docId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 60);
   if (!docId) return json({ ok: false, error: "no_docId" });
   const meta = await db2Get(env, "ragIndex/" + uid + "/" + docId);
   const count = meta && meta.chunks ? meta.chunks : 0;
   const ids = [];
   for (let i = 0; i < count; i++) ids.push(uid.slice(0, 20) + "_" + docId + "_" + i);
-  try { if (ids.length) await env.VEC.deleteByIds(ids); } catch (e) {}
+  if (ids.length) await pcFetch(env, "/vectors/delete", { ids, namespace: uid });
   await db2Delete(env, "rag/" + uid + "/" + docId);
   await db2Delete(env, "ragIndex/" + uid + "/" + docId);
   return json({ ok: true, deleted: count });
@@ -582,7 +595,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     if (path === "/health") {
-      return json({ ok: true, worker: "zama-satellite", rag: !!env.VEC, files: !!env.R2, kv: !!env.KV, ts: Date.now() });
+      return json({ ok: true, worker: "zama-satellite", rag: pcReady(env), files: !!env.R2, kv: !!env.KV, ts: Date.now() });
     }
     if (path === "/file/get") return handleFileGet(env, url);
 
