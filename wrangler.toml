@@ -1,0 +1,17 @@
+name = "zama-sat-2"
+main = "satellite.js"
+compatibility_date = "2026-06-01"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "1adc65338a2e4bf8b46baa6aad9d34cf"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "zama-files"
+
+[triggers]
+crons = ["0 * * * *"]
