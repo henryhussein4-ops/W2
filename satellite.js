@@ -99,18 +99,38 @@ async function db1GetPublic(env, path) {
   } catch (e) { return null; }
 }
 
+/* ---------- Key pools: any secret may hold ONE key or MANY comma-separated.
+   We never pre-rotate; we try the first, and only fall to the next if it errors
+   or returns an auth/limit status. Idle spares are never touched. ---------- */
+function keyList(val) {
+  return String(val || "").split(",").map(k => k.trim()).filter(Boolean);
+}
+function hostList(env) {
+  // PINECONE_HOST may also be a comma list, paired by position with PINECONE_KEY.
+  const hosts = keyList(env.PINECONE_HOST);
+  return hosts.length ? hosts : [""];
+}
+
 /* ---------- Pinecone vector store (replaces Vectorize) ---------- */
-function pcReady(env) { return !!(env.PINECONE_KEY && env.PINECONE_HOST); }
+function pcReady(env) { return keyList(env.PINECONE_KEY).length > 0 && !!env.PINECONE_HOST; }
 async function pcFetch(env, path, payload) {
-  try {
-    const r = await fetch(String(env.PINECONE_HOST).replace(/\/$/, "") + path, {
-      method: "POST",
-      headers: { "Api-Key": env.PINECONE_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch (e) { return null; }
+  const keys = keyList(env.PINECONE_KEY);
+  const hosts = hostList(env);
+  for (let i = 0; i < keys.length; i++) {
+    const host = hosts[i] || hosts[0];
+    try {
+      const r = await fetch(String(host).replace(/\/$/, "") + path, {
+        method: "POST",
+        headers: { "Api-Key": keys[i], "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) return await r.json();
+      // 401/403/429 => this key is bad or throttled, try the next one
+      if (r.status === 401 || r.status === 403 || r.status === 429) continue;
+      return null; // a real query error (e.g. 400) — next key won't help
+    } catch (e) { /* network — try next key */ }
+  }
+  return null;
 }
 
 /* ---------- Auth: verify Firebase ID token from the Zama app ---------- */
@@ -379,47 +399,61 @@ async function handleNearby(env, body) {
   const results = [];
   let cat = null;
   for (const k of Object.keys(PLACE_CATEGORIES)) { if (query.includes(k)) { cat = PLACE_CATEGORIES[k]; break; } }
-  if (cat && env.GEOAPIFY_KEY) {
-    try {
-      const u = "https://api.geoapify.com/v2/places?categories=" + encodeURIComponent(cat) +
-        "&filter=circle:" + lon + "," + lat + "," + radius + "&bias=proximity:" + lon + "," + lat +
-        "&limit=12&apiKey=" + env.GEOAPIFY_KEY;
-      const r = await fetch(u);
-      if (r.ok) {
-        const d = await r.json();
-        for (const f of (d.features || [])) {
-          const p = f.properties || {};
-          results.push({ name: p.name || p.address_line1 || "Unnamed", address: p.address_line2 || p.formatted || "", lat: p.lat, lon: p.lon, km: distKm(lat, lon, p.lat, p.lon), category: p.categories ? p.categories[0] : cat });
+  const geoKeys = keyList(env.GEOAPIFY_KEY);
+  if (cat && geoKeys.length) {
+    for (const gk of geoKeys) {
+      try {
+        const u = "https://api.geoapify.com/v2/places?categories=" + encodeURIComponent(cat) +
+          "&filter=circle:" + lon + "," + lat + "," + radius + "&bias=proximity:" + lon + "," + lat +
+          "&limit=12&apiKey=" + gk;
+        const r = await fetch(u);
+        if (r.ok) {
+          const d = await r.json();
+          for (const f of (d.features || [])) {
+            const p = f.properties || {};
+            results.push({ name: p.name || p.address_line1 || "Unnamed", address: p.address_line2 || p.formatted || "", lat: p.lat, lon: p.lon, km: distKm(lat, lon, p.lat, p.lon), category: p.categories ? p.categories[0] : cat });
+          }
+          break;
         }
-      }
-    } catch (e) {}
+        if (r.status !== 401 && r.status !== 403 && r.status !== 429) break;
+      } catch (e) {}
+    }
   }
-  if (!results.length && env.GEOAPIFY_KEY) {
-    try {
-      const u = "https://api.geoapify.com/v1/geocode/search?text=" + encodeURIComponent(query) +
-        "&bias=proximity:" + lon + "," + lat + "&limit=10&apiKey=" + env.GEOAPIFY_KEY;
-      const r = await fetch(u);
-      if (r.ok) {
-        const d = await r.json();
-        for (const f of (d.features || [])) {
-          const p = f.properties || {};
-          results.push({ name: p.name || p.address_line1 || p.formatted || "Result", address: p.formatted || "", lat: p.lat, lon: p.lon, km: distKm(lat, lon, p.lat, p.lon), category: p.result_type || "place" });
+  if (!results.length && geoKeys.length) {
+    for (const gk of geoKeys) {
+      try {
+        const u = "https://api.geoapify.com/v1/geocode/search?text=" + encodeURIComponent(query) +
+          "&bias=proximity:" + lon + "," + lat + "&limit=10&apiKey=" + gk;
+        const r = await fetch(u);
+        if (r.ok) {
+          const d = await r.json();
+          for (const f of (d.features || [])) {
+            const p = f.properties || {};
+            results.push({ name: p.name || p.address_line1 || p.formatted || "Result", address: p.formatted || "", lat: p.lat, lon: p.lon, km: distKm(lat, lon, p.lat, p.lon), category: p.result_type || "place" });
+          }
+          break;
         }
-      }
-    } catch (e) {}
+        if (r.status !== 401 && r.status !== 403 && r.status !== 429) break;
+      } catch (e) {}
+    }
   }
-  if (!results.length && env.MAPBOX_KEY) {
-    try {
-      const u = "https://api.mapbox.com/geocoding/v5/mapbox.places/" + encodeURIComponent(query) + ".json?proximity=" + lon + "," + lat + "&limit=10&access_token=" + env.MAPBOX_KEY;
-      const r = await fetch(u);
-      if (r.ok) {
-        const d = await r.json();
-        for (const f of (d.features || [])) {
-          const c = f.center || [0, 0];
-          results.push({ name: f.text || "Result", address: f.place_name || "", lat: c[1], lon: c[0], km: distKm(lat, lon, c[1], c[0]), category: (f.place_type && f.place_type[0]) || "place" });
+  const mbKeys = keyList(env.MAPBOX_KEY);
+  if (!results.length && mbKeys.length) {
+    for (const mk of mbKeys) {
+      try {
+        const u = "https://api.mapbox.com/geocoding/v5/mapbox.places/" + encodeURIComponent(query) + ".json?proximity=" + lon + "," + lat + "&limit=10&access_token=" + mk;
+        const r = await fetch(u);
+        if (r.ok) {
+          const d = await r.json();
+          for (const f of (d.features || [])) {
+            const c = f.center || [0, 0];
+            results.push({ name: f.text || "Result", address: f.place_name || "", lat: c[1], lon: c[0], km: distKm(lat, lon, c[1], c[0]), category: (f.place_type && f.place_type[0]) || "place" });
+          }
+          break;
         }
-      }
-    } catch (e) {}
+        if (r.status !== 401 && r.status !== 403 && r.status !== 429) break;
+      } catch (e) {}
+    }
   }
   results.sort((a, b) => a.km - b.km);
   return json({ ok: true, query, results: results.slice(0, 12) });
@@ -427,13 +461,20 @@ async function handleNearby(env, body) {
 
 /* ---------- Videos (Pexels catalog in DB2, fetched by cron) ---------- */
 async function fetchPexelsBatch(env, topic) {
-  if (!env.PEXELS_KEY) return null;
+  const pxKeys = keyList(env.PEXELS_KEY);
+  if (!pxKeys.length) return null;
+  let d = null;
+  for (const pk of pxKeys) {
+    try {
+      const r = await fetch("https://api.pexels.com/videos/search?query=" + encodeURIComponent(topic || "nature") + "&per_page=10&size=medium", {
+        headers: { "Authorization": pk }
+      });
+      if (r.ok) { d = await r.json(); break; }
+      if (r.status !== 401 && r.status !== 403 && r.status !== 429) return null;
+    } catch (e) {}
+  }
+  if (!d) return null;
   try {
-    const r = await fetch("https://api.pexels.com/videos/search?query=" + encodeURIComponent(topic || "nature") + "&per_page=10&size=medium", {
-      headers: { "Authorization": env.PEXELS_KEY }
-    });
-    if (!r.ok) return null;
-    const d = await r.json();
     const vids = [];
     for (const v of (d.videos || [])) {
       const files = (v.video_files || []).filter(f => f.file_type === "video/mp4").sort((a, b) => (a.width || 0) - (b.width || 0));
