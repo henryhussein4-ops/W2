@@ -211,11 +211,13 @@ async function runVisionOnFrame(env, prompt, frameB64) {
   return "";
 }
 async function runEmbed(env, texts) {
+  if (!env.AI || typeof env.AI.run !== "function") { runEmbed._err = "no_ai_binding"; return null; }
   try {
     const r = await env.AI.run(EMBED_MODEL, { text: texts });
     if (r && r.data && Array.isArray(r.data)) return r.data;
+    runEmbed._err = "empty_embed_response";
     return null;
-  } catch (e) { return null; }
+  } catch (e) { runEmbed._err = String(e && e.message ? e.message : e).slice(0, 160); return null; }
 }
 
 /* ---------- Endpoint handlers ---------- */
@@ -296,7 +298,7 @@ async function handleEmbed(env, body) {
   const texts = Array.isArray(body.texts) ? body.texts.slice(0, 20).map(t => String(t).slice(0, 2000)) : [String(body.text || "").slice(0, 2000)];
   if (!texts[0]) return json({ ok: false, error: "no_text" });
   const vecs = await runEmbed(env, texts);
-  if (!vecs) return json({ ok: false, error: "embed_failed" });
+  if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "" });
   return json({ ok: true, vectors: vecs });
 }
 
@@ -323,7 +325,7 @@ async function handleRagUpsert(env, uid, body) {
   for (let i = 0; i < chunks.length; i += 10) {
     const batch = chunks.slice(i, i + 10);
     const vecs = await runEmbed(env, batch);
-    if (!vecs) return json({ ok: false, error: "embed_failed", stored: ids.length });
+    if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "", stored: ids.length });
     const items = [];
     for (let j = 0; j < batch.length; j++) {
       const id = uid.slice(0, 20) + "_" + docId + "_" + (i + j);
@@ -344,7 +346,7 @@ async function handleRagQuery(env, uid, body) {
   const threshold = Math.min(Math.max(Number(body.threshold) || RAG_THRESHOLD_DEFAULT, 0.2), 0.95);
   const topK = Math.min(Math.max(Number(body.topK) || 4, 1), 8);
   const vecs = await runEmbed(env, [q]);
-  if (!vecs) return json({ ok: false, error: "embed_failed" });
+  if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "" });
   const res = await pcFetch(env, "/query", { vector: vecs[0], topK, namespace: uid, includeMetadata: true });
   if (!res) return json({ ok: false, error: "vector_query_failed" });
   const matches = [];
