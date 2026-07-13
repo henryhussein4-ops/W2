@@ -210,7 +210,30 @@ async function runVisionOnFrame(env, prompt, frameB64) {
   }
   return "";
 }
-async function runEmbed(env, texts) {
+async function runEmbedCohere(env, texts, mode) {
+  const keys = keyList(env.COHERE_KEY);
+  if (!keys.length) return null;
+  const inputType = mode === "query" ? "search_query" : "search_document";
+  const model = env.COHERE_EMBED_MODEL || "embed-multilingual-v3.0";
+  for (const key of keys) {
+    try {
+      const r = await fetch("https://api.cohere.com/v2/embed", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
+        body: JSON.stringify({ model, texts, input_type: inputType, embedding_types: ["float"] })
+      });
+      if (r.status === 401 || r.status === 429) { runEmbed._err = "cohere_" + r.status; continue; }
+      if (!r.ok) { runEmbed._err = "cohere_http_" + r.status; return null; }
+      const d = await r.json();
+      const vecs = d && d.embeddings && Array.isArray(d.embeddings.float) ? d.embeddings.float : null;
+      if (vecs) return vecs;
+      runEmbed._err = "cohere_empty";
+      return null;
+    } catch (e) { runEmbed._err = "cohere_" + String(e && e.message ? e.message : e).slice(0, 120); continue; }
+  }
+  return null;
+}
+async function runEmbedCf(env, texts) {
   if (!env.AI || typeof env.AI.run !== "function") { runEmbed._err = "no_ai_binding"; return null; }
   try {
     const r = await env.AI.run(EMBED_MODEL, { text: texts });
@@ -218,6 +241,20 @@ async function runEmbed(env, texts) {
     runEmbed._err = "empty_embed_response";
     return null;
   } catch (e) { runEmbed._err = String(e && e.message ? e.message : e).slice(0, 160); return null; }
+}
+// mode: "document" (default, for stored knowledge) or "query" (for questions)
+// Prefer Cohere when a key is set (frees Cloudflare neurons); fall back to Workers AI.
+async function runEmbed(env, texts, mode) {
+  runEmbed._err = "";
+  if (keyList(env.COHERE_KEY).length) {
+    const v = await runEmbedCohere(env, texts, mode);
+    if (v) return v;
+    // Cohere rate-limited/unavailable — try Workers AI as a safety net
+    const cf = await runEmbedCf(env, texts);
+    if (cf) return cf;
+    return null;
+  }
+  return await runEmbedCf(env, texts);
 }
 
 /* ---------- Endpoint handlers ---------- */
@@ -297,7 +334,7 @@ async function handleChat(env, body) {
 async function handleEmbed(env, body) {
   const texts = Array.isArray(body.texts) ? body.texts.slice(0, 20).map(t => String(t).slice(0, 2000)) : [String(body.text || "").slice(0, 2000)];
   if (!texts[0]) return json({ ok: false, error: "no_text" });
-  const vecs = await runEmbed(env, texts);
+  const vecs = await runEmbed(env, texts, body.mode === "query" ? "query" : "document");
   if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "" });
   return json({ ok: true, vectors: vecs });
 }
@@ -324,7 +361,7 @@ async function handleRagUpsert(env, uid, body) {
   const ids = [];
   for (let i = 0; i < chunks.length; i += 10) {
     const batch = chunks.slice(i, i + 10);
-    const vecs = await runEmbed(env, batch);
+    const vecs = await runEmbed(env, batch, "document");
     if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "", stored: ids.length });
     const items = [];
     for (let j = 0; j < batch.length; j++) {
@@ -345,7 +382,7 @@ async function handleRagQuery(env, uid, body) {
   if (!q) return json({ ok: false, error: "no_query" });
   const threshold = Math.min(Math.max(Number(body.threshold) || RAG_THRESHOLD_DEFAULT, 0.2), 0.95);
   const topK = Math.min(Math.max(Number(body.topK) || 4, 1), 8);
-  const vecs = await runEmbed(env, [q]);
+  const vecs = await runEmbed(env, [q], "query");
   if (!vecs) return json({ ok: false, error: "embed_failed", reason: runEmbed._err || "" });
   const res = await pcFetch(env, "/query", { vector: vecs[0], topK, namespace: uid, includeMetadata: true });
   if (!res) return json({ ok: false, error: "vector_query_failed" });
