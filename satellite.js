@@ -370,6 +370,26 @@ async function handleRagDelete(env, uid, body) {
   return json({ ok: true, deleted: count });
 }
 
+async function handleRagList(env, uid) {
+  if (!env.DB2_URL || !env.DB2_SECRET) return json({ ok: false, error: "no_db2" });
+  const idx = await db2Get(env, "ragIndex/" + uid);
+  const docs = [];
+  if (idx && typeof idx === "object") {
+    for (const docId of Object.keys(idx)) {
+      const m = idx[docId] || {};
+      docs.push({
+        docId: docId,
+        source: m.source || "",
+        kind: m.kind || "",
+        chunks: m.chunks || 0,
+        ts: m.ts || 0
+      });
+    }
+  }
+  docs.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+  return json({ ok: true, docs: docs });
+}
+
 /* ---------- Nearby (Geoapify + Mapbox fallback) ---------- */
 const PLACE_CATEGORIES = {
   hospital: "healthcare.hospital", clinic: "healthcare.clinic_or_praxis", pharmacy: "healthcare.pharmacy",
@@ -659,6 +679,7 @@ export default {
         case "/rag/upsert": return await handleRagUpsert(env, uid, body);
         case "/rag/query": return await handleRagQuery(env, uid, body);
         case "/rag/delete": return await handleRagDelete(env, uid, body);
+        case "/rag/list": return await handleRagList(env, uid);
         case "/nearby": return await handleNearby(env, body);
         case "/videos": return await handleVideos(env, uid, isAdmin, url);
         case "/news": return await handleNews(env, url);
